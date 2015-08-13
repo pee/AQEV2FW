@@ -268,10 +268,10 @@ char * commands[] = {
   "mqttauth   ",
   "updatesrv  ",
   "backup     ",
-  "no2_cal    ",
+  "no2_sen    ",
   "no2_slope  ",
   "no2_off    ",
-  "co_cal     ",
+  "co_sen     ",
   "co_slope   ",
   "co_off     ",
   "temp_off   ",
@@ -361,7 +361,10 @@ const uint8_t heartbeat_waveform[NUM_HEARTBEAT_WAVEFORM_SAMPLES] PROGMEM = {
 uint8_t heartbeat_waveform_index = 0;
 
 char scratch[1024] = { 0 };  // scratch buffer, for general use
-
+char converted_value_string[64] = {0};
+char compensated_value_string[64] = {0};
+char raw_value_string[64] = {0};
+  
 void setup() {
   boolean integrity_check_passed = false;
   boolean valid_ssid_passed = false; 
@@ -402,7 +405,7 @@ void setup() {
   // if a software update introduced new settings
   // they should be populated with defaults as necessary
   initializeNewConfigSettings();
-  
+
   // config mode processing loop
   do{
     // check for initial integrity of configuration in eeprom
@@ -956,6 +959,7 @@ void initializeHardware(void) {
 
 /****** CONFIGURATION SUPPORT FUNCTIONS ******/
 void initializeNewConfigSettings(void){
+  static char command_buf[32] = {0};
   boolean in_config_mode = false; 
   allowed_to_write_config_eeprom = true;
   
@@ -963,7 +967,7 @@ void initializeNewConfigSettings(void){
   uint8_t backlight_startup = eeprom_read_byte((uint8_t *) EEPROM_BACKLIGHT_STARTUP);
   uint16_t backlight_duration = eeprom_read_word((uint16_t *) EEPROM_BACKLIGHT_DURATION);
   if((backlight_startup == 0xFF) || (backlight_duration == 0xFFFF)){
-    configInject("aqe\r");
+    configInject("aqe\r");    
     configInject("backlight initon\r");
     configInject("backlight 60\r");
     in_config_mode = true;
@@ -976,10 +980,38 @@ void initializeNewConfigSettings(void){
   if((l_sampling_interval == 0xFFFF) || (l_reporting_interval == 0xFFFF) || (l_averaging_interval == 0xFFFF)){
     if(!in_config_mode){
       configInject("aqe\r");
+      in_config_mode = true;
     }
-    configInject("sampling 5, 160, 5\r");
-    in_config_mode = true;
+    configInject("sampling 5, 160, 5\r");    
   }    
+
+  // the following two blocks of code are a 'hot-fix' to the slope calculation, 
+  // only apply it if the slope is not already self consistent with the sensitivity
+  float sensitivity = eeprom_read_float((const float *) EEPROM_NO2_SENSITIVITY);  
+  float calculated_slope = convert_no2_sensitivity_to_slope(sensitivity);
+  float stored_slope = eeprom_read_float((const float *) EEPROM_NO2_CAL_SLOPE);
+  if(calculated_slope != stored_slope){ 
+    if(!in_config_mode){
+      configInject("aqe\r");
+      in_config_mode = true;
+    }    
+    memset(command_buf, 0, 32);  
+    snprintf(command_buf, 31, "no2_sen %8.4f\r", sensitivity);
+    configInject(command_buf);
+  }
+  
+  sensitivity = eeprom_read_float((const float *) EEPROM_CO_SENSITIVITY);  
+  calculated_slope = convert_co_sensitivity_to_slope(sensitivity);
+  stored_slope = eeprom_read_float((const float *) EEPROM_CO_CAL_SLOPE);
+  if(calculated_slope != stored_slope){ 
+    if(!in_config_mode){
+      configInject("aqe\r");
+      in_config_mode = true;
+    }    
+    memset(command_buf, 0, 32);  
+    snprintf(command_buf, 31, "co_sen %8.4f\r", sensitivity);
+    configInject(command_buf);  
+  }
   
   if(in_config_mode){
     configInject("exit\r");
@@ -1251,10 +1283,10 @@ void help_menu(char * arg) {
       Serial.println(F("      mqttauth - MQTT authentication enabled?"));      
       Serial.println(F("      updatesrv - Update server name"));      
       Serial.println(F("      updatefile - Update filename (no extension)"));          
-      Serial.println(F("      no2_cal - NO2 sensitivity [nA/ppm]"));
+      Serial.println(F("      no2_sen - NO2 sensitivity [nA/ppm]"));
       Serial.println(F("      no2_slope - NO2 sensors slope [ppb/V]"));
       Serial.println(F("      no2_off - NO2 sensors offset [V]"));
-      Serial.println(F("      co_cal - CO sensitivity [nA/ppm]"));
+      Serial.println(F("      co_sen - CO sensitivity [nA/ppm]"));
       Serial.println(F("      co_slope - CO sensors slope [ppm/V]"));
       Serial.println(F("      co_off - CO sensors offset [V]"));
       Serial.println(F("      temp_off - Temperature sensor reporting offset [degC] (subtracted)"));
@@ -1463,8 +1495,8 @@ void help_menu(char * arg) {
       Serial.println(F("      hum      - backs up the Humidity calibration parameters"));      
       Serial.println(F("      all      - does all of the above"));
     }
-    else if (strncmp("no2_cal", arg, 7) == 0) {
-      Serial.println(F("no2_cal <number>"));
+    else if (strncmp("no2_sen", arg, 7) == 0) {
+      Serial.println(F("no2_sen <number>"));
       Serial.println(F("   <number> is the decimal value of NO2 sensitivity [nA/ppm]"));
       Serial.println(F("   note: also sets the NO2 slope based on the sensitivity"));
     }
@@ -1476,8 +1508,8 @@ void help_menu(char * arg) {
       Serial.println(F("no2_off <number>"));
       Serial.println(F("   <number> is the decimal value of NO2 sensor offset [V]"));
     }
-    else if (strncmp("co_cal", arg, 6) == 0) {
-      Serial.println(F("co_cal <number>"));
+    else if (strncmp("co_sen", arg, 6) == 0) {
+      Serial.println(F("co_sen <number>"));
       Serial.println(F("   <number> is the decimal value of CO sensitivity [nA/ppm]"));
       Serial.println(F("   note: also sets the CO slope based on the sensitivity"));      
     }
@@ -1831,7 +1863,7 @@ void print_eeprom_value(char * arg) {
   else if (strncmp(arg, "ipmode", 6) == 0) {
     print_eeprom_ipmode();
   }
-  else if (strncmp(arg, "no2_cal", 7) == 0) {
+  else if (strncmp(arg, "no2_sen", 7) == 0) {
     print_eeprom_float((const float *) EEPROM_NO2_SENSITIVITY);
   }
   else if (strncmp(arg, "no2_slope", 9) == 0) {
@@ -1840,7 +1872,7 @@ void print_eeprom_value(char * arg) {
   else if (strncmp(arg, "no2_off", 7) == 0) {
     print_eeprom_float((const float *) EEPROM_NO2_CAL_OFFSET);
   }
-  else if (strncmp(arg, "co_cal", 6) == 0) {
+  else if (strncmp(arg, "co_sen", 6) == 0) {
     print_eeprom_float((const float *) EEPROM_CO_SENSITIVITY);
   }
   else if (strncmp(arg, "co_slope", 8) == 0) {
@@ -2491,11 +2523,17 @@ void AQE_set_datetime(char * arg){
   
   // if we have an RTC set the time in the RTC
   DateTime datetime(yr,mo,dy,hr,mn,sc);
-  if(init_rtc_ok){
-    selectSlot3();
-    rtc.adjust(datetime);
-  }
   
+  // it's not harmful to do this
+  // even if the RTC is not present
+  selectSlot3();
+  rtc.adjust(datetime);
+  
+  // also clear the Oscillator Stop Flag
+  // this should really be folded into the RTCLib code
+  rtcClearOscillatorStopFlag();
+  
+      
   // at any rate sync the time to this
   setTime(datetime.unixtime());
   
@@ -3239,14 +3277,20 @@ void set_float_param(char * arg, float * eeprom_address, float (*conversion)(flo
   if(!configMemoryUnlocked(__LINE__)){
     return;
   }
+
+  // read the value at that address from eeprom
+  float current_value = eeprom_read_float((const float *) eeprom_address);  
   
   float value = 0.0;
   if (convertStringToFloat(arg, &value)) {
     if (conversion) {
       value = conversion(value);
     }
-    eeprom_write_float(eeprom_address, value);
-    recomputeAndStoreConfigChecksum();
+
+    if(current_value != value){
+      eeprom_write_float(eeprom_address, value);
+      recomputeAndStoreConfigChecksum();
+    }
   }
   else {
     Serial.print(F("Error: Failed to convert string \""));
@@ -3258,12 +3302,12 @@ void set_float_param(char * arg, float * eeprom_address, float (*conversion)(flo
 // convert from nA/ppm to ppb/V
 // from SPEC Sensors, Sensor Development Kit, User Manual, Rev. 1.5
 // M[V/ppb] = Sensitivity[nA/ppm] * TIA_Gain[kV/A] * 10^-9[A/nA] * 10^3[V/kV] * 10^-3[ppb/ppm]
-// TIA_Gain[kV/A] for NO2 = 499
+// TIA_Gain[kV/A] for NO2 = 350
 // slope = 1/M
 float convert_no2_sensitivity_to_slope(float sensitivity) {
-  float ret = 1.0e9;
+  float ret = 1.0e9f;
   ret /= sensitivity;
-  ret /= 499.0;
+  ret /= 350.0f;
   return ret;
 }
 
@@ -3292,12 +3336,12 @@ void set_reported_humidity_offset(char * arg) {
 // convert from nA/ppm to ppb/V
 // from SPEC Sensors, Sensor Development Kit, User Manual, Rev. 1.5
 // M[V/ppm] = Sensitivity[nA/ppm] * TIA_Gain[kV/A] * 10^-9[A/nA] * 10^3[V/kV]
-// TIA_Gain[kV/A] for CO = 100
+// TIA_Gain[kV/A] for CO = 350
 // slope = 1/M
 float convert_co_sensitivity_to_slope(float sensitivity) {
-  float ret = 1.0e6;
+  float ret = 1.0e6f;
   ret /= sensitivity;
-  ret /= 100.0;
+  ret /= 350.0f;
   return ret;
 }
 
@@ -3406,58 +3450,15 @@ void selectSlot3(void){
 }
 /****** LCD SUPPORT FUNCTIONS ******/
 void safe_dtostrf(float value, signed char width, unsigned char precision, char * target_buffer, uint16_t target_buffer_length){
-  char tmp[32] = {0}; // working buffer, don't modify real buffer until we know it fits in width
-  char * p_tmp = &(tmp[0]);
-  uint32_t whole_number_part = 0;
-  float fractional_part = 0.0f;
-  int8_t sign = value < 0.0f ? -1 : 1;
-  value = sign * value; // absolute value
-  uint32_t fractional_part_as_integer = 0;
-  uint8_t ii = 0;
-  
-  // ignore the allowed negativity of dtostrf
-  if(width < 0){
-    width = -width;  
-  }
-  
-  if(target_buffer_length < 2){ // need at least space for a character and the null terminator
-    return; 
-  }
-  
-  if((sign < 0) && (target_buffer_length < 3)){ // need at least space for the sign, a character, and the null terminator
-    return;
+  char meta_format_string[16] = "%%.%df";
+  char format_string[16] = {0};
+
+  if((target_buffer != NULL) && (target_buffer_length > 0)){  
+    snprintf(format_string, 15, meta_format_string, precision); // format string should come out to something like "%.2f"
+    snprintf(target_buffer, target_buffer_length - 1, format_string, value);
   }
 
-  whole_number_part = (uint32_t) value; // aboslute value
-  fractional_part = value - whole_number_part;   // remainder
-  
-  // move the decimal place over the precision number of times
-  uint32_t multiplier = 1L;
-  for(ii = 0; ii < precision; ii++){
-    multiplier *= 10L;
-  }
-  fractional_part *= 1.0f * multiplier;
-  
-  // round to the nearest
-  fractional_part += 0.5f;  
-  fractional_part_as_integer = (uint32_t) fractional_part; // truncate the value
-  
-  // handle negative numbers, we *know* that there is room to do the following operation
-  // based on guard above "if((sign < 0) && (target_buffer_length < 3)) return;"
-  if(sign < 0){
-    tmp[0] = '-';      // the first character is a negative sign
-    p_tmp = &(tmp[1]); // the beginning of the target buffer is now the next character
-    snprintf(p_tmp, 31, "%lu.%lu", whole_number_part, fractional_part_as_integer);    
-  }
-  else{
-    p_tmp = &(tmp[0]);
-    snprintf(p_tmp, 32, "%lu.%lu", whole_number_part, fractional_part_as_integer); // the full buffer is available
-  }
-  
-  if(strlen(tmp) < target_buffer_length){
-    strncpy(target_buffer, tmp, target_buffer_length);
-  }  
-
+    
 }
 
 void backlightOn(void) {
@@ -3993,10 +3994,13 @@ boolean restartWifi(){
     }
     delayForWatchdog();
     petWatchdog();
+    current_millis = millis();
     reconnectToAccessPoint();
+    current_millis = millis();
     delayForWatchdog();
     petWatchdog();    
     acquireIpAddress(); 
+    current_millis = millis();
     delayForWatchdog();
     petWatchdog();    
     displayConnectionDetails();
@@ -4184,6 +4188,13 @@ boolean burstSampleADC(float * result){
 }
 
 /****** MQTT SUPPORT FUNCTIONS ******/
+void clearTempBuffers(void){
+  memset(converted_value_string, 0, 64);
+  memset(compensated_value_string, 0, 64);
+  memset(raw_value_string, 0, 64);
+  memset(scratch, 0, 512);
+}
+
 boolean mqttResolve(void){
   uint32_t ip = 0;
   static boolean resolved = false;
@@ -4331,9 +4342,7 @@ float toFahrenheit(float degC){
 }
 
 boolean publishTemperature(){
-  char value_string[64] = {0};
-  char raw_string[64] = {0};
-  memset(scratch, 0, 512);
+  clearTempBuffers();
   float temperature_moving_average = calculateAverage(sample_buffer[TEMPERATURE_SAMPLE_BUFFER], sample_buffer_depth);
   temperature_degc = temperature_moving_average;
   float raw_temperature = temperature_degc;
@@ -4342,10 +4351,10 @@ boolean publishTemperature(){
     reported_temperature = toFahrenheit(reported_temperature);
     raw_temperature = toFahrenheit(raw_temperature);
   }
-  safe_dtostrf(reported_temperature, -6, 2, value_string, 16);
-  safe_dtostrf(raw_temperature, -6, 2, raw_string, 16);
-  trim_string(value_string);
-  trim_string(raw_string);
+  safe_dtostrf(reported_temperature, -6, 2, converted_value_string, 16);
+  safe_dtostrf(raw_temperature, -6, 2, raw_value_string, 16);
+  trim_string(converted_value_string);
+  trim_string(raw_value_string);
   snprintf(scratch, 511,
     "{"
     "\"serial-number\":\"%s\","
@@ -4354,24 +4363,22 @@ boolean publishTemperature(){
     "\"raw-value\":%s,"
     "\"raw-units\":\"deg%c\","
     "\"sensor-part-number\":\"SHT25\""
-    "}", mqtt_client_id, value_string, temperature_units, raw_string, temperature_units);
+    "}", mqtt_client_id, converted_value_string, temperature_units, raw_value_string, temperature_units);
     
   return mqttPublish(MQTT_TOPIC_PREFIX "temperature", scratch);
 }
 
 boolean publishHumidity(){
-  char value_string[64] = {0};  
-  char raw_string[64] = {0};
-  memset(scratch, 0, 512);
+  clearTempBuffers();
   float humidity_moving_average = calculateAverage(sample_buffer[HUMIDITY_SAMPLE_BUFFER], sample_buffer_depth);
   relative_humidity_percent = humidity_moving_average;
-  float raw_humidity = relative_humidity_percent;
-  float reported_humidity = relative_humidity_percent - reported_humidity_offset_percent;  
+  float raw_humidity = constrain(relative_humidity_percent, 0.0f, 100.0f);
+  float reported_humidity = constrain(relative_humidity_percent - reported_humidity_offset_percent, 0.0f, 100.0f);
   
-  safe_dtostrf(reported_humidity, -6, 2, value_string, 16);
-  safe_dtostrf(raw_humidity, -6, 2, raw_string, 16);
-  trim_string(value_string);
-  trim_string(raw_string);
+  safe_dtostrf(reported_humidity, -6, 2, converted_value_string, 16);
+  safe_dtostrf(raw_humidity, -6, 2, raw_value_string, 16);
+  trim_string(converted_value_string);
+  trim_string(raw_value_string);
   snprintf(scratch, 511, 
     "{"
     "\"serial-number\":\"%s\","    
@@ -4380,7 +4387,7 @@ boolean publishHumidity(){
     "\"raw-value\":%s,"
     "\"raw-units\":\"percent\","  
     "\"sensor-part-number\":\"SHT25\""
-    "}", mqtt_client_id, value_string, raw_string);  
+    "}", mqtt_client_id, converted_value_string, raw_value_string);  
   return mqttPublish(MQTT_TOPIC_PREFIX "humidity", scratch);
 }
 
@@ -4549,10 +4556,7 @@ void no2_convert_from_volts_to_ppb(float volts, float * converted_value, float *
 }
 
 boolean publishNO2(){
-  char raw_value_string[64] = {0};  
-  char converted_value_string[64] = {0};
-  char compensated_value_string[64] = {0};
-  memset(scratch, 0, 512);  
+  clearTempBuffers();
   float converted_value = 0.0f, compensated_value = 0.0f;    
   float no2_moving_average = calculateAverage(sample_buffer[NO2_SAMPLE_BUFFER], sample_buffer_depth);
   no2_convert_from_volts_to_ppb(no2_moving_average, &converted_value, &compensated_value);
@@ -4619,9 +4623,7 @@ void co_convert_from_volts_to_ppm(float volts, float * converted_value, float * 
 }
 
 boolean publishCO(){
-  char raw_value_string[64] = {0};  
-  char converted_value_string[64] = {0};
-  memset(scratch, 0, 512);
+  clearTempBuffers();
   char compensated_value_string[64] = {0};
   float converted_value = 0.0f, compensated_value = 0.0f;   
   float co_moving_average = calculateAverage(sample_buffer[CO_SAMPLE_BUFFER], sample_buffer_depth);
@@ -4850,9 +4852,11 @@ float calculateAverage(float * buf, uint16_t num_samples){
 // otherwise printCsvDataLine will terminate the line implicitly
 void printCsvDataLine(const char * augmented_header){
   static boolean first = true;
-  char dataString[512] = {0};
+  static char dataString[512] = {0};  
+  memset(dataString, 0, 512);
+  
   uint16_t len = 0;
-  uint16_t dataStringRemaining = 511;                  
+  uint16_t dataStringRemaining = 511;
   
   if(first){
     char * header_row = "Timestamp,"
@@ -5563,6 +5567,24 @@ void getNowFilename(char * dst, uint16_t max_len){
     month(n),
     day(n),
     hour(n));
+}
+
+void rtcClearOscillatorStopFlag(void){
+    Wire.beginTransmission(DS3231_ADDRESS);
+    Wire.write(DS3231_REG_CONTROL);
+    Wire.endTransmission();
+
+    // control registers
+    Wire.requestFrom(DS3231_ADDRESS, 2);
+    uint8_t creg = Wire.read(); 
+    uint8_t sreg = Wire.read();   
+    
+    sreg &= ~_BV(7); // clear bit 7 (msbit)
+    
+    Wire.beginTransmission(DS3231_ADDRESS);
+    Wire.write((uint8_t) DS3231_REG_STATUS_CTL);
+    Wire.write((uint8_t) sreg);
+    Wire.endTransmission();    
 }
 
 /*
